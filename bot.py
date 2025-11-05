@@ -112,6 +112,7 @@ class QuizBot:
         self.groups = self.load_groups()
         self.settings = self.load_settings()
         self.stats = self.load_stats()
+        self.sudo_users = self.load_sudo_users()  # Load sudo users
         self.broadcast_mode = {}
         self.scheduler_task = None
         self.quiz_interval = self.settings.get('quiz_interval', 3600)  # Default 1 hour
@@ -162,6 +163,49 @@ class QuizBot:
             }
             self.mongo.insert_one('stats', stats)
         return stats
+    
+    def load_sudo_users(self):
+        """Load sudo users from MongoDB"""
+        sudo_users = self.mongo.find('sudo_users')
+        print(f"✅ Loaded {len(sudo_users)} sudo users from database")
+        return sudo_users
+    
+    def is_admin_or_sudo(self, user_id):
+        """Check if user is admin or sudo user"""
+        return user_id == ADMIN_USER_ID or any(sudo['user_id'] == user_id for sudo in self.sudo_users)
+    
+    def get_sudo_user(self, user_id):
+        """Get sudo user by user_id"""
+        return self.mongo.find_one('sudo_users', {'user_id': user_id})
+    
+    def add_sudo_user(self, user_id, username=None, added_by=None):
+        """Add a sudo user"""
+        if self.get_sudo_user(user_id):
+            return False, "User is already a sudo user!"
+        
+        sudo_user = {
+            'user_id': user_id,
+            'username': username,
+            'added_by': added_by or ADMIN_USER_ID,
+            'added_date': datetime.now().isoformat(),
+            'rights': 'full'  # Same as admin
+        }
+        
+        self.mongo.insert_one('sudo_users', sudo_user)
+        self.sudo_users = self.load_sudo_users()  # Reload sudo users
+        
+        return True, f"✅ User @{username if username else user_id} has been added as sudo user!"
+    
+    def remove_sudo_user(self, user_id):
+        """Remove a sudo user"""
+        sudo_user = self.get_sudo_user(user_id)
+        if not sudo_user:
+            return False, "User is not a sudo user!"
+        
+        self.mongo.delete_one('sudo_users', {'user_id': user_id})
+        self.sudo_users = self.load_sudo_users()  # Reload sudo users
+        
+        return True, f"✅ User @{sudo_user.get('username', user_id)} has been removed from sudo users!"
     
     def save_quiz(self, quiz):
         """Save quiz to MongoDB"""
@@ -291,7 +335,7 @@ class QuizBot:
         chat_type = update.effective_chat.type
         
         if chat_type == 'private':
-            if user_id == ADMIN_USER_ID:
+            if self.is_admin_or_sudo(user_id):
                 keyboard = [
                     [InlineKeyboardButton("📊 View Statistics", callback_data="stats")],
                     [InlineKeyboardButton("📝 Add Quiz", callback_data="add_quiz")],
@@ -299,14 +343,16 @@ class QuizBot:
                     [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
                     [InlineKeyboardButton("👥 Manage Groups", callback_data="manage_groups")],
                     [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
-                    [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
+                    [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
+                    [InlineKeyboardButton("👑 Manage Sudo", callback_data="manage_sudo")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 quiz_interval_hours = self.quiz_interval / 3600
+                user_type = "Admin" if user_id == ADMIN_USER_ID else "Sudo User"
                 
                 await update.message.reply_text(
-                    f"👋 **Admin Dashboard**\n\n"
+                    f"👋 **{user_type} Dashboard**\n\n"
                     f"I'm your Quiz Bot! Choose an option below:\n\n"
                     f"📊 **Statistics** - View detailed bot analytics\n"
                     f"📝 **Add Quiz** - Create and send me a QUIZ MODE poll to save as quiz\n"
@@ -314,7 +360,8 @@ class QuizBot:
                     f"📢 **Broadcast** - Send message to all groups\n"
                     f"👥 **Manage Groups** - View and manage groups\n"
                     f"📋 **Export Data** - Export quizzes and stats\n"
-                    f"🔄 **Reset Quizzes** - Delete all saved quizzes\n\n"
+                    f"🔄 **Reset Quizzes** - Delete all saved quizzes\n"
+                    f"👑 **Manage Sudo** - Add/remove sudo users\n\n"
                     f"To add a quiz: Create a QUIZ MODE poll and send it to me!",
                     reply_markup=reply_markup
                 )
@@ -361,8 +408,8 @@ class QuizBot:
         # Reload groups from MongoDB
         self.groups = self.load_groups()
         
-        # Send welcome message with group controls for admin
-        if update.effective_user.id == ADMIN_USER_ID:
+        # Send welcome message with group controls for admin/sudo
+        if self.is_admin_or_sudo(update.effective_user.id):
             keyboard = [
                 [InlineKeyboardButton("🚫 Remove from Group", callback_data=f"remove_group_{chat_id}")],
                 [InlineKeyboardButton("📊 Group Stats", callback_data=f"group_stats_{chat_id}")]
@@ -373,11 +420,11 @@ class QuizBot:
             await update.message.reply_text(message)
     
     async def handle_private_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle private messages from admin"""
+        """Handle private messages from admin/sudo"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("I only accept commands from the admin.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("I only accept commands from admin or sudo users.")
             return
         
         # Check if user is in broadcast mode
@@ -556,11 +603,11 @@ class QuizBot:
             await update.message.reply_text("❌ This command can only be used in groups!")
             return
         
-        # Check if user is admin of the group or bot admin
+        # Check if user is admin of the group or bot admin/sudo
         is_admin = False
         
-        # Check if user is bot admin
-        if user_id == ADMIN_USER_ID:
+        # Check if user is bot admin or sudo
+        if self.is_admin_or_sudo(user_id):
             is_admin = True
         else:
             # Check if user is admin in the group
@@ -626,12 +673,191 @@ class QuizBot:
             print(f"Error sending immediate quiz: {e}")
             await update.message.reply_text("❌ Failed to send quiz. Please try again later.")
     
+    async def sudo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /sudo command to add sudo users"""
+        user_id = update.effective_user.id
+        
+        # Only admin can add sudo users
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ Only the bot owner can add sudo users!")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "👑 **Add Sudo User**\n\n"
+                "Usage: `/sudo <user_id> [username]`\n\n"
+                "Examples:\n"
+                "• `/sudo 123456789` - Add user by ID\n"
+                "• `/sudo 123456789 john_doe` - Add user by ID with username\n\n"
+                f"📊 Current sudo users: {len(self.sudo_users)}"
+            )
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+            username = context.args[1] if len(context.args) > 1 else None
+            
+            # Check if trying to add admin as sudo
+            if target_user_id == ADMIN_USER_ID:
+                await update.message.reply_text("❌ The bot owner is already the supreme admin!")
+                return
+            
+            # Check if user is already sudo
+            if self.get_sudo_user(target_user_id):
+                await update.message.reply_text("❌ This user is already a sudo user!")
+                return
+            
+            success, message = self.add_sudo_user(target_user_id, username, user_id)
+            await update.message.reply_text(message)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID! Please provide a numeric user ID.")
+    
+    async def unsudo_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /unsudo command to remove sudo users"""
+        user_id = update.effective_user.id
+        
+        # Only admin can remove sudo users
+        if user_id != ADMIN_USER_ID:
+            await update.message.reply_text("❌ Only the bot owner can remove sudo users!")
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "👑 **Remove Sudo User**\n\n"
+                "Usage: `/unsudo <user_id>`\n\n"
+                "Examples:\n"
+                "• `/unsudo 123456789` - Remove user by ID\n\n"
+                f"📊 Current sudo users: {len(self.sudo_users)}"
+            )
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+            
+            # Check if trying to remove admin
+            if target_user_id == ADMIN_USER_ID:
+                await update.message.reply_text("❌ Cannot remove the bot owner!")
+                return
+            
+            success, message = self.remove_sudo_user(target_user_id)
+            await update.message.reply_text(message)
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID! Please provide a numeric user ID.")
+    
+    async def manage_sudo_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show sudo users management interface"""
+        user_id = update.effective_user.id
+        
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("❌ This command is for admin/sudo users only.")
+            return
+        
+        sudo_text = f"👑 **Sudo Users Management**\n\n📊 **Total Sudo Users:** {len(self.sudo_users)}\n\n"
+        
+        if self.sudo_users:
+            sudo_text += "**Current Sudo Users:**\n"
+            for i, sudo in enumerate(self.sudo_users, 1):
+                added_by = "Owner" if sudo['added_by'] == ADMIN_USER_ID else f"User {sudo['added_by']}"
+                sudo_text += f"{i}. User ID: `{sudo['user_id']}`"
+                if sudo.get('username'):
+                    sudo_text += f" (@{sudo['username']})"
+                sudo_text += f"\n   Added by: {added_by}\n   Date: {datetime.fromisoformat(sudo['added_date']).strftime('%Y-%m-%d %H:%M')}\n\n"
+        else:
+            sudo_text += "No sudo users added yet.\n\n"
+        
+        keyboard = []
+        if user_id == ADMIN_USER_ID:
+            keyboard.append([InlineKeyboardButton("➕ Add Sudo User", callback_data="add_sudo")])
+            if self.sudo_users:
+                keyboard.append([InlineKeyboardButton("➖ Remove Sudo User", callback_data="remove_sudo")])
+        
+        keyboard.append([InlineKeyboardButton("📊 Statistics", callback_data="stats")])
+        keyboard.append([InlineKeyboardButton("⚙️ Settings", callback_data="settings")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(sudo_text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(sudo_text, reply_markup=reply_markup)
+    
+    async def add_sudo_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Add sudo user from callback"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.callback_query.answer("Only the bot owner can add sudo users!")
+            return
+        
+        await update.callback_query.edit_message_text(
+            "👑 **Add Sudo User**\n\n"
+            "To add a sudo user, use the command:\n"
+            "`/sudo <user_id> [username]`\n\n"
+            "Examples:\n"
+            "• `/sudo 123456789` - Add user by ID\n"
+            "• `/sudo 123456789 john_doe` - Add user by ID with username\n\n"
+            "💡 You can get a user's ID by forwarding their message to @userinfobot\n"
+            "💡 Sudo users have the same rights as the bot owner"
+        )
+    
+    async def remove_sudo_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Remove sudo user from callback"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.callback_query.answer("Only the bot owner can remove sudo users!")
+            return
+        
+        if not self.sudo_users:
+            await update.callback_query.answer("No sudo users to remove!")
+            return
+        
+        keyboard = []
+        for sudo in self.sudo_users:
+            button_text = f"User {sudo['user_id']}"
+            if sudo.get('username'):
+                button_text += f" (@{sudo['username']})"
+            keyboard.append([InlineKeyboardButton(
+                f"➖ {button_text}", 
+                callback_data=f"remove_sudo_{sudo['user_id']}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="manage_sudo")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.callback_query.edit_message_text(
+            "👑 **Remove Sudo User**\n\n"
+            "Select a user to remove from sudo:",
+            reply_markup=reply_markup
+        )
+    
+    async def confirm_remove_sudo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Confirm and remove sudo user"""
+        user_id = update.effective_user.id
+        
+        if user_id != ADMIN_USER_ID:
+            await update.callback_query.answer("Only the bot owner can remove sudo users!")
+            return
+        
+        callback_data = update.callback_query.data
+        target_user_id = int(callback_data.split('_')[2])
+        
+        success, message = self.remove_sudo_user(target_user_id)
+        
+        await update.callback_query.edit_message_text(
+            f"{message}\n\n"
+            f"📊 Remaining sudo users: {len(self.sudo_users)}"
+        )
+    
     async def reset_quizzes_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset command to delete all quizzes"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         if not context.args or context.args[0].lower() != 'confirm':
@@ -667,8 +893,8 @@ class QuizBot:
         """Reset quizzes from callback menu"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.callback_query.answer("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.callback_query.answer("This command is for admin/sudo users only.")
             return
         
         keyboard = [
@@ -691,8 +917,8 @@ class QuizBot:
         """Confirm and execute quiz reset"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.callback_query.answer("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.callback_query.answer("This command is for admin/sudo users only.")
             return
         
         # Delete all quizzes
@@ -719,8 +945,8 @@ class QuizBot:
         """Handle /setexplanation command"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         if not context.args:
@@ -749,8 +975,8 @@ class QuizBot:
         """Set explanation from callback (settings menu)"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.callback_query.answer("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.callback_query.answer("This command is for admin/sudo users only.")
             return
         
         current_explanation = self.settings.get('quiz_explanation', "Check back later for results!")
@@ -769,7 +995,7 @@ class QuizBot:
         """Handle explanation input from settings menu"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID or not context.user_data.get('waiting_for_explanation'):
+        if not self.is_admin_or_sudo(user_id) or not context.user_data.get('waiting_for_explanation'):
             return
         
         new_explanation = update.message.text
@@ -790,8 +1016,8 @@ class QuizBot:
         """Show detailed bot statistics"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         total_quizzes = len(self.quizzes)
@@ -833,6 +1059,11 @@ class QuizBot:
             f"   • Quiz interval: {quiz_interval_hours} hours\n"
             f"   • Next quiz in: ~{quiz_interval_hours} hours\n\n"
             
+            f"👑 **Users**\n"
+            f"   • Admin: 1 (Owner)\n"
+            f"   • Sudo users: {len(self.sudo_users)}\n"
+            f"   • Total privileged users: {1 + len(self.sudo_users)}\n\n"
+            
             f"📈 **Engagement**\n"
             f"   • Avg quizzes per group: {total_quizzes_sent/total_groups if total_groups > 0 else 0:.1f}\n"
             f"   • Total engagement score: {sum(self.stats['group_engagement'].values())}\n"
@@ -843,7 +1074,8 @@ class QuizBot:
             [InlineKeyboardButton("📋 Export Data", callback_data="export_data")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="stats")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
-            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
+            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
+            [InlineKeyboardButton("👑 Manage Sudo", callback_data="manage_sudo")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -856,8 +1088,8 @@ class QuizBot:
         """Show bot settings"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         quiz_interval_hours = self.quiz_interval / 3600
@@ -873,7 +1105,8 @@ class QuizBot:
             f"   - Data persistence status\n\n"
             f"👥 **Active Groups**: {len([g for g in self.groups if g.get('is_active', True)])}\n"
             f"📝 **Active Quizzes**: {len([q for q in self.quizzes if q.get('is_active', True)])}\n"
-            f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n\n"
+            f"🎯 **Manual Quizzes Sent**: {self.stats.get('manual_quizzes_sent', 0)}\n"
+            f"👑 **Sudo Users**: {len(self.sudo_users)}\n\n"
             f"💡 Use /setdelay <time> to change the quiz interval\n"
             f"💡 Use /setexplanation to change quiz explanation\n"
             f"💡 Group admins can use /rquiz for immediate quizzes"
@@ -885,7 +1118,8 @@ class QuizBot:
             [InlineKeyboardButton("🗑️ Clean Inactive", callback_data="clean_inactive")],
             [InlineKeyboardButton("🔄 Refresh Groups", callback_data="refresh_groups")],
             [InlineKeyboardButton("📊 Statistics", callback_data="stats")],
-            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")]
+            [InlineKeyboardButton("🔄 Reset Quizzes", callback_data="reset_quizzes")],
+            [InlineKeyboardButton("👑 Manage Sudo", callback_data="manage_sudo")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -898,8 +1132,8 @@ class QuizBot:
         """Handle /setdelay command directly"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         if not context.args:
@@ -962,8 +1196,8 @@ class QuizBot:
         """Set quiz interval from callback (settings menu)"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.callback_query.answer("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.callback_query.answer("This command is for admin/sudo users only.")
             return
         
         await update.callback_query.edit_message_text(
@@ -985,7 +1219,7 @@ class QuizBot:
         """Handle quiz interval input from settings menu"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID or not context.user_data.get('waiting_for_interval'):
+        if not self.is_admin_or_sudo(user_id) or not context.user_data.get('waiting_for_interval'):
             return
         
         time_input = update.message.text
@@ -1036,8 +1270,8 @@ class QuizBot:
         """Start broadcast mode"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         self.broadcast_mode[user_id] = True
@@ -1110,8 +1344,8 @@ class QuizBot:
         """Export bot data to JSON and CSV files"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         try:
@@ -1152,6 +1386,23 @@ class QuizBot:
                     caption="👥 Groups Export (CSV)"
                 )
             
+            # Export sudo users to CSV
+            if self.sudo_users:
+                with open('sudo_users_export.csv', 'w', newline='', encoding='utf-8') as csvfile:
+                    fieldnames = ['user_id', 'username', 'added_by', 'added_date', 'rights']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for sudo in self.sudo_users:
+                        writer.writerow(sudo)
+                
+                # Send sudo users CSV
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=open('sudo_users_export.csv', 'rb'),
+                    filename='sudo_users_export.csv',
+                    caption="👑 Sudo Users Export (CSV)"
+                )
+            
             # Export stats to JSON
             with open('stats_export.json', 'w', encoding='utf-8') as f:
                 json.dump(self.stats, f, indent=2, ensure_ascii=False)
@@ -1170,6 +1421,7 @@ class QuizBot:
                 f"📁 Files exported:\n"
                 f"• quizzes_export.csv ({len(self.quizzes)} quizzes)\n"
                 f"• groups_export.csv ({len(self.groups)} groups)\n"
+                f"• sudo_users_export.csv ({len(self.sudo_users)} sudo users)\n"
                 f"• stats_export.json (statistics)\n\n"
                 f"💾 All data has been exported successfully!"
             )
@@ -1190,8 +1442,8 @@ class QuizBot:
         """Show group management interface"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         total_groups = len(self.groups)
@@ -1232,8 +1484,8 @@ class QuizBot:
         """Remove inactive groups"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         # Find inactive groups
@@ -1260,8 +1512,8 @@ class QuizBot:
         """Reactivate all groups"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         # Reactivate all groups
@@ -1281,8 +1533,8 @@ class QuizBot:
         """Refresh groups list"""
         user_id = update.effective_user.id
         
-        if user_id != ADMIN_USER_ID:
-            await update.message.reply_text("This command is for admin only.")
+        if not self.is_admin_or_sudo(user_id):
+            await update.message.reply_text("This command is for admin/sudo users only.")
             return
         
         # Reload groups from MongoDB
@@ -1342,6 +1594,14 @@ class QuizBot:
             await self.reactivate_all_groups(update, context)
         elif data == "refresh_groups":
             await self.refresh_groups(update, context)
+        elif data == "manage_sudo":
+            await self.manage_sudo_users(update, context)
+        elif data == "add_sudo":
+            await self.add_sudo_callback(update, context)
+        elif data == "remove_sudo":
+            await self.remove_sudo_callback(update, context)
+        elif data.startswith("remove_sudo_"):
+            await self.confirm_remove_sudo(update, context)
         elif data.startswith("remove_group_"):
             chat_id = int(data.split("_")[2])
             await self.remove_group(update, context, chat_id)
@@ -1401,6 +1661,8 @@ class QuizBot:
         self.application.add_handler(CommandHandler("setexplanation", self.set_explanation_command))
         self.application.add_handler(CommandHandler("rquiz", self.send_immediate_quiz))
         self.application.add_handler(CommandHandler("reset", self.reset_quizzes_command))
+        self.application.add_handler(CommandHandler("sudo", self.sudo_command))
+        self.application.add_handler(CommandHandler("unsudo", self.unsudo_command))
         
         # Handle both text messages and polls
         self.application.add_handler(MessageHandler(
@@ -1439,8 +1701,10 @@ class QuizBot:
         print(f"✅ Bot is now running with MongoDB support!")
         print(f"⏰ Quiz interval: {quiz_interval_hours} hours")
         print(f"📊 Loaded {len(self.quizzes)} quizzes and {len(self.groups)} groups from database")
+        print(f"👑 Loaded {len(self.sudo_users)} sudo users from database")
         print(f"🎯 /rquiz command enabled for group admins")
-        print(f"🔄 /reset command available for admin")
+        print(f"🔄 /reset command available for admin/sudo")
+        print(f"👑 /sudo and /unsudo commands available for admin only")
         print(f"🔄 IMPROVED Anti-repeat system active: Tracks last {self.max_recent_track} sent quizzes")
         print(f"👤 Quiz acceptance: Both anonymous and non-anonymous QUIZ MODE polls accepted")
         print(f"📤 Quiz sending: ALWAYS sends as NON-ANONYMOUS (voters visible)")
